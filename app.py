@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import json
@@ -57,6 +58,23 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_git_lfs_pointer(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(200)
+    except OSError:
+        return False
+    return header.startswith(b"version https://git-lfs.github.com/spec/v1")
+
+
 def interpolation_from_name(name: str) -> InterpolationMode:
     name = (name or "bicubic").lower()
     return {
@@ -67,14 +85,19 @@ def interpolation_from_name(name: str) -> InterpolationMode:
     }.get(name, InterpolationMode.BICUBIC)
 
 
-def safe_torch_load(checkpoint_bytes: bytes, device: torch.device):
-    """Prefer safer weights-only loading, then fall back for the thesis full-checkpoint format."""
-    buffer = io.BytesIO(checkpoint_bytes)
+def safe_torch_load(checkpoint_path: Path, device: torch.device):
+    """Load a trusted thesis checkpoint directly from disk without duplicating it in RAM."""
+    if is_git_lfs_pointer(checkpoint_path):
+        raise RuntimeError(
+            f"{checkpoint_path.name} is a Git LFS pointer, not the actual checkpoint. "
+            "Run `git lfs pull` (or make sure your deployment downloads Git LFS objects)."
+        )
     try:
-        return torch.load(buffer, map_location=device, weights_only=True)
+        return torch.load(checkpoint_path, map_location=device, weights_only=True)
     except Exception:
-        buffer.seek(0)
-        return torch.load(buffer, map_location=device, weights_only=False)
+        # The thesis checkpoints are trusted project files and may contain metadata
+        # that requires the full PyTorch loader.
+        return torch.load(checkpoint_path, map_location=device, weights_only=False)
 
 
 def extract_state_dict(checkpoint):
@@ -139,15 +162,15 @@ class LoadedModel:
     device: torch.device
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=2)
 def load_checkpoint_model(
-    checkpoint_bytes: bytes,
-    uploaded_name: str,
+    checkpoint_path: str,
     fallback_classes: tuple[str, ...],
     device_name: str,
 ) -> LoadedModel:
+    path = Path(checkpoint_path)
     device = torch.device(device_name)
-    checkpoint = safe_torch_load(checkpoint_bytes, device)
+    checkpoint = safe_torch_load(path, device)
     state_dict = strip_module_prefix(extract_state_dict(checkpoint))
 
     names = checkpoint_class_names(checkpoint)
@@ -193,8 +216,8 @@ def load_checkpoint_model(
     )
 
     meta = {
-        "file": uploaded_name,
-        "sha256": sha256_bytes(checkpoint_bytes),
+        "file": path.name,
+        "sha256": sha256_file(path),
         "model_name": checkpoint.get("model_name", MODEL_NAME)
         if isinstance(checkpoint, dict)
         else MODEL_NAME,
@@ -204,7 +227,13 @@ def load_checkpoint_model(
         "std": std,
         "interpolation": interpolation,
     }
-    return LoadedModel(uploaded_name, model, names, transform, meta, device)
+    # Release the deserialized checkpoint/state-dict references after the model
+    # has copied the parameters. This matters on memory-constrained deployments.
+    del state_dict
+    del checkpoint
+    gc.collect()
+
+    return LoadedModel(path.name, model, names, transform, meta, device)
 
 
 def pil_rgb(file_or_bytes) -> Image.Image:
@@ -388,35 +417,45 @@ def confusion_figure(y_true, y_pred, class_names: list[str], title: str):
     return fig
 
 
-def parse_batch_zip(zip_bytes: bytes, class_names: list[str]) -> tuple[list[dict], list[str]]:
+def _zip_maps(class_names: list[str]) -> tuple[dict, dict]:
     class_map = {normalized_name(name): (idx, name) for idx, name in enumerate(class_names)}
     severity_map = {normalized_name(sev): sev for sev in SEVERITY_ORDER}
-    # Accept common aliases used in the training notebook/folders.
     severity_map.update({"severity1": "Mild", "s1": "Mild"})
     severity_map.update({"severity2": "Moderate", "s2": "Moderate"})
     severity_map.update({"severity3": "Severe", "sever": "Severe", "s3": "Severe"})
+    return class_map, severity_map
 
+
+def open_zip_source(zip_source):
+    """Open a Streamlit UploadedFile (or Path, if reused elsewhere) as a ZIP."""
+    if isinstance(zip_source, Path):
+        return zipfile.ZipFile(zip_source, "r")
+    if hasattr(zip_source, "seek"):
+        zip_source.seek(0)
+    return zipfile.ZipFile(zip_source, "r")
+
+
+def parse_batch_zip_index(zip_source, class_names: list[str]) -> tuple[list[dict], list[str]]:
+    """Read only ZIP metadata. Images are decoded later one inference batch at a time."""
+    class_map, severity_map = _zip_maps(class_names)
     records: list[dict] = []
     skipped: list[str] = []
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+
+    with open_zip_source(zip_source) as zf:
         for info in zf.infolist():
             if info.is_dir():
                 continue
             path = PurePosixPath(info.filename)
             if path.suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
+
             parts = [normalized_name(p) for p in path.parts[:-1]]
             class_hit = next((class_map[p] for p in parts if p in class_map), None)
             severity_hit = next((severity_map[p] for p in parts if p in severity_map), None)
             if class_hit is None or severity_hit is None:
                 skipped.append(info.filename)
                 continue
-            try:
-                data = zf.read(info)
-                image = pil_rgb(data)
-            except Exception:
-                skipped.append(info.filename)
-                continue
+
             class_idx, class_name = class_hit
             records.append(
                 {
@@ -424,16 +463,93 @@ def parse_batch_zip(zip_bytes: bytes, class_names: list[str]) -> tuple[list[dict
                     "severity": severity_hit,
                     "true_index": class_idx,
                     "true_label": class_name,
-                    "image": image,
                 }
             )
+
     return records, skipped
+
+
+def evaluate_zip_streaming(
+    zip_source,
+    records: list[dict],
+    vanilla_bundle: LoadedModel,
+    curriculum_bundle: LoadedModel,
+    batch_size: int,
+    progress,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Decode and infer on only one small image batch at a time."""
+    rows: list[dict] = []
+    decode_skipped: list[str] = []
+    total = len(records)
+
+    with open_zip_source(zip_source) as zf:
+        for start in range(0, total, batch_size):
+            chunk_records = records[start : start + batch_size]
+            valid_records: list[dict] = []
+            images: list[Image.Image] = []
+
+            for record in chunk_records:
+                try:
+                    # Read/decode only this image. Nothing from previous batches is retained.
+                    image = pil_rgb(zf.read(record["filename"]))
+                    image.load()
+                    images.append(image)
+                    valid_records.append(record)
+                except Exception:
+                    decode_skipped.append(record["filename"])
+
+            if images:
+                v_pred, v_conf = batch_predict(vanilla_bundle, images, batch_size)
+                c_pred, c_conf = batch_predict(curriculum_bundle, images, batch_size)
+
+                for idx, record in enumerate(valid_records):
+                    rows.append(
+                        {
+                            "filename": record["filename"],
+                            "severity": record["severity"],
+                            "true_index": record["true_index"],
+                            "true_label": record["true_label"],
+                            "vanilla_pred_index": int(v_pred[idx]),
+                            "vanilla_prediction": vanilla_bundle.class_names[int(v_pred[idx])],
+                            "vanilla_confidence": float(v_conf[idx]),
+                            "curriculum_pred_index": int(c_pred[idx]),
+                            "curriculum_prediction": curriculum_bundle.class_names[int(c_pred[idx])],
+                            "curriculum_confidence": float(c_conf[idx]),
+                        }
+                    )
+
+            for image in images:
+                image.close()
+            del images
+
+            processed = min(start + len(chunk_records), total)
+            fraction = processed / total if total else 1.0
+            progress.progress(
+                fraction,
+                text=f"Evaluating images... {processed:,}/{total:,}",
+            )
+
+    return pd.DataFrame(rows), decode_skipped
 
 
 def format_metric(value: float) -> str:
     if pd.isna(value):
         return "N/A"
     return f"{value * 100:.2f}%"
+
+
+BATCH_STATE_KEYS = [
+    "batch_result_df",
+    "vanilla_metrics",
+    "curriculum_metrics",
+    "vanilla_by_severity",
+    "curriculum_by_severity",
+]
+
+
+def clear_batch_results() -> None:
+    for key in BATCH_STATE_KEYS:
+        st.session_state.pop(key, None)
 
 
 # ============================================================
@@ -483,7 +599,6 @@ with st.expander("What this app calculates", expanded=False):
 #     └── curriculum.pth
 
 BASE_DIR = Path(__file__).resolve().parent
-
 MODEL_PATHS = {
     "Run 1": {
         "vanilla": BASE_DIR / "models" / "run1" / "vanilla.pth",
@@ -513,6 +628,15 @@ with st.sidebar:
     )
     st.caption(f"Inference device: **{device_name.upper()}**")
 
+previous_run = st.session_state.get("_active_model_run")
+if previous_run is not None and previous_run != selected_run:
+    clear_batch_results()
+    load_checkpoint_model.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+st.session_state["_active_model_run"] = selected_run
+
 vanilla_path = MODEL_PATHS[selected_run]["vanilla"]
 curriculum_path = MODEL_PATHS[selected_run]["curriculum"]
 
@@ -536,14 +660,12 @@ if missing_files:
 try:
     with st.spinner(f"Loading {selected_run} ConvNeXtV2 models..."):
         vanilla_bundle = load_checkpoint_model(
-            vanilla_path.read_bytes(),
-            vanilla_path.name,
+            str(vanilla_path),
             fallback_classes,
             device_name,
         )
         curriculum_bundle = load_checkpoint_model(
-            curriculum_path.read_bytes(),
-            curriculum_path.name,
+            str(curriculum_path),
             fallback_classes,
             device_name,
         )
@@ -599,7 +721,7 @@ with single_tab:
             vanilla_probs = probability_table(CLASS_NAMES, vanilla_result["probabilities"])
             st.dataframe(
                 vanilla_probs.style.format({"Probability": "{:.2%}"}),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.bar_chart(vanilla_probs.set_index("Class")["Probability"])
@@ -611,7 +733,7 @@ with single_tab:
             curriculum_probs = probability_table(CLASS_NAMES, curriculum_result["probabilities"])
             st.dataframe(
                 curriculum_probs.style.format({"Probability": "{:.2%}"}),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.bar_chart(curriculum_probs.set_index("Class")["Probability"])
@@ -648,13 +770,13 @@ with single_tab:
                 st.image(
                     v_overlay,
                     caption=f"Standard / Vanilla — target: {CLASS_NAMES[v_target]}",
-                    use_container_width=True,
+                    width="stretch",
                 )
             with h2:
                 st.image(
                     c_overlay,
                     caption=f"Curriculum — target: {CLASS_NAMES[c_target]}",
-                    use_container_width=True,
+                    width="stretch",
                 )
             st.caption(
                 "Grad-CAM highlights spatial regions that most influenced the selected class score. "
@@ -689,15 +811,46 @@ with batch_tab:
         "The class folder names must match the checkpoint class names."
     )
 
-    zip_file = st.file_uploader("Upload labeled batch ZIP", type=["zip"], key="batch_zip")
-    batch_size = st.slider("Inference batch size", min_value=1, max_value=64, value=16, step=1)
+    # The repository may contain test.zip for storage/reference, but the app
+    # intentionally does not auto-load it. Every visitor supplies their own ZIP.
+    zip_file = st.file_uploader(
+        "Upload labeled batch ZIP",
+        type=["zip"],
+        key="batch_zip",
+        help="Upload your own ZIP containing severity and class folders.",
+    )
 
+    zip_source = zip_file if zip_file is not None else None
+    source_signature = None
     if zip_file is not None:
+        source_signature = (
+            "upload",
+            zip_file.name,
+            getattr(zip_file, "size", None),
+        )
+
+    batch_size = st.slider(
+        "Inference batch size",
+        min_value=1,
+        max_value=32,
+        value=8,
+        step=1,
+        help="Lower this if the deployed app has limited memory.",
+    )
+
+    if source_signature != st.session_state.get("_batch_source_signature"):
+        clear_batch_results()
+        st.session_state["_batch_source_signature"] = source_signature
+
+    if zip_source is not None:
         try:
-            records, skipped = parse_batch_zip(zip_file.getvalue(), CLASS_NAMES)
+            records, skipped = parse_batch_zip_index(zip_source, CLASS_NAMES)
         except zipfile.BadZipFile:
-            st.error("The uploaded file is not a valid ZIP archive.")
-            st.stop()
+            st.error(
+                "The selected file is not a valid ZIP archive. "
+                "If it is stored with Git LFS, make sure the actual LFS object was downloaded."
+            )
+            records, skipped = [], []
 
         if not records:
             st.error(
@@ -715,9 +868,12 @@ with batch_tab:
                     for r in records
                 ]
             )
-            st.success(f"Parsed {len(records):,} labeled images.")
+
+            st.success(f"Found {len(records):,} labeled images.")
             if skipped:
-                st.warning(f"Skipped {len(skipped):,} image files whose class/severity could not be determined.")
+                st.warning(
+                    f"Skipped {len(skipped):,} image files whose class/severity could not be determined."
+                )
                 with st.expander("Show skipped files"):
                     st.write(skipped[:500])
 
@@ -728,30 +884,40 @@ with batch_tab:
                 .reset_index()
             )
             st.markdown("#### Batch composition")
-            st.dataframe(count_table, use_container_width=True, hide_index=True)
+            st.dataframe(count_table, width="stretch", hide_index=True)
 
             if st.button("Run batch evaluation", type="primary"):
-                images = [r["image"] for r in records]
-                progress = st.progress(0, text="Running Standard / Vanilla inference...")
-                v_pred, v_conf = batch_predict(vanilla_bundle, images, batch_size)
-                progress.progress(50, text="Running Curriculum inference...")
-                c_pred, c_conf = batch_predict(curriculum_bundle, images, batch_size)
-                progress.progress(100, text="Evaluation complete.")
+                progress = st.progress(0, text="Preparing streaming evaluation...")
+                try:
+                    result_df, decode_skipped = evaluate_zip_streaming(
+                        zip_source,
+                        records,
+                        vanilla_bundle,
+                        curriculum_bundle,
+                        batch_size,
+                        progress,
+                    )
+                except RuntimeError as exc:
+                    if "out of memory" in str(exc).lower():
+                        st.error(
+                            "The inference device ran out of memory. "
+                            "Reduce the inference batch size and try again."
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        st.stop()
+                    raise
 
-                result_df = pd.DataFrame(
-                    {
-                        "filename": [r["filename"] for r in records],
-                        "severity": [r["severity"] for r in records],
-                        "true_index": [r["true_index"] for r in records],
-                        "true_label": [r["true_label"] for r in records],
-                        "vanilla_pred_index": v_pred,
-                        "vanilla_prediction": [CLASS_NAMES[i] for i in v_pred],
-                        "vanilla_confidence": v_conf,
-                        "curriculum_pred_index": c_pred,
-                        "curriculum_prediction": [CLASS_NAMES[i] for i in c_pred],
-                        "curriculum_confidence": c_conf,
-                    }
-                )
+                progress.progress(1.0, text="Evaluation complete.")
+
+                if decode_skipped:
+                    st.warning(
+                        f"Skipped {len(decode_skipped):,} files that could not be decoded as images."
+                    )
+
+                if result_df.empty:
+                    st.error("No valid images were available for inference.")
+                    st.stop()
 
                 vanilla_metrics, vanilla_by_severity = evaluate_thesis_metrics(
                     result_df,
@@ -798,7 +964,7 @@ with batch_tab:
         formatted = comparison_df.copy()
         for col in ["Standard / Vanilla", "Curriculum"]:
             formatted[col] = formatted[col].map(format_metric)
-        st.dataframe(formatted, use_container_width=True, hide_index=True)
+        st.dataframe(formatted, width="stretch", hide_index=True)
 
         st.caption(
             "For this app, Mean Classification Error follows the thesis study definition: "
@@ -813,14 +979,14 @@ with batch_tab:
                 display_v = vanilla_by_severity.copy()
                 for col in ["Accuracy", "Macro Precision", "Macro Recall", "Macro F1"]:
                     display_v[col] = display_v[col].map(lambda x: f"{x:.2%}")
-                st.dataframe(display_v, use_container_width=True, hide_index=True)
+                st.dataframe(display_v, width="stretch", hide_index=True)
         with s2:
             st.markdown("#### Curriculum by severity")
             if not curriculum_by_severity.empty:
                 display_c = curriculum_by_severity.copy()
                 for col in ["Accuracy", "Macro Precision", "Macro Recall", "Macro F1"]:
                     display_c[col] = display_c[col].map(lambda x: f"{x:.2%}")
-                st.dataframe(display_c, use_container_width=True, hide_index=True)
+                st.dataframe(display_c, width="stretch", hide_index=True)
 
         st.divider()
         st.subheader("Confusion-matrix heatmaps")
@@ -837,7 +1003,7 @@ with batch_tab:
                     CLASS_NAMES,
                     f"Standard / Vanilla — {severity_view}",
                 )
-                st.pyplot(fig, use_container_width=True)
+                st.pyplot(fig, width="stretch")
                 plt.close(fig)
             with cm2:
                 fig = confusion_figure(
@@ -846,7 +1012,7 @@ with batch_tab:
                     CLASS_NAMES,
                     f"Curriculum — {severity_view}",
                 )
-                st.pyplot(fig, use_container_width=True)
+                st.pyplot(fig, width="stretch")
                 plt.close(fig)
 
         st.divider()
@@ -868,7 +1034,7 @@ with batch_tab:
                     "curriculum_confidence": "{:.2%}",
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
