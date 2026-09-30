@@ -20,7 +20,7 @@ Upload a ZIP whose image paths contain both a degradation severity and true dise
 - Severity-specific Accuracy / Macro Precision / Macro Recall / Macro F1
 - Accuracy Robustness Drop: `Accuracy_Mild - Accuracy_Severe`
 - Macro-F1 Robustness Drop: `MacroF1_Mild - MacroF1_Severe`
-- Mean Corruption Error (thesis study definition): mean of `1 - Accuracy_s` over Mild, Moderate, Severe
+- Mean Classification Error (thesis study definition): mean of `1 - Accuracy_s` over Mild, Moderate, Severe
 - Confusion-matrix heatmaps
 - Per-image predictions and confidence
 - CSV and JSON exports

@@ -352,9 +352,9 @@ def evaluate_thesis_metrics(
 
     if all(sev in severity_lookup.index for sev in SEVERITY_ORDER):
         errors = [1.0 - float(severity_lookup.loc[sev, "Accuracy"]) for sev in SEVERITY_ORDER]
-        overall["Mean Corruption Error"] = float(np.mean(errors))
+        overall["Mean Classification Error"] = float(np.mean(errors))
     else:
-        overall["Mean Corruption Error"] = math.nan
+        overall["Mean Classification Error"] = math.nan
 
     if all(sev in severity_lookup.index for sev in ["Mild", "Severe"]):
         overall["Accuracy Robustness Drop"] = float(
@@ -461,7 +461,7 @@ with st.expander("What this app calculates", expanded=False):
         - Mild / Moderate / Severe Accuracy and Macro F1
         - Accuracy Robustness Drop: `Accuracy_Mild - Accuracy_Severe`
         - Macro-F1 Robustness Drop: `MacroF1_Mild - MacroF1_Severe`
-        - Mean Corruption Error (study definition): mean of `1 - Accuracy_s` over Mild, Moderate, Severe
+        - Mean Classification Error (study definition): mean of `1 - Accuracy_s` over Mild, Moderate, Severe
         - Confusion-matrix heatmaps
         """
     )
@@ -786,7 +786,7 @@ with batch_tab:
             "Macro F1",
             "Accuracy Robustness Drop",
             "Macro F1 Robustness Drop",
-            "Mean Corruption Error",
+            "Mean Classification Error",
         ]
         comparison_df = pd.DataFrame(
             {
@@ -801,7 +801,7 @@ with batch_tab:
         st.dataframe(formatted, use_container_width=True, hide_index=True)
 
         st.caption(
-            "For this app, Mean Corruption Error follows the thesis study definition: "
+            "For this app, Mean Classification Error follows the thesis study definition: "
             "the mean of (1 − Accuracy) across Mild, Moderate, and Severe. "
             "Robustness Drop compares Mild against Severe."
         )
