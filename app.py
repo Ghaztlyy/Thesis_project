@@ -6,7 +6,7 @@ import json
 import math
 import zipfile
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 import matplotlib.pyplot as plt
@@ -468,49 +468,87 @@ with st.expander("What this app calculates", expanded=False):
 
 
 # ============================================================
-# Sidebar checkpoint setup
+# Model checkpoint setup
 # ============================================================
+# Expected folder structure:
+# models/
+# ├── run1/
+# │   ├── vanilla.pth
+# │   └── curriculum.pth
+# ├── run2/
+# │   ├── vanilla.pth
+# │   └── curriculum.pth
+# └── run3/
+#     ├── vanilla.pth
+#     └── curriculum.pth
+
+BASE_DIR = Path(__file__).resolve().parent
+
+MODEL_PATHS = {
+    "Run 1": {
+        "vanilla": BASE_DIR / "models" / "run1" / "vanilla.pth",
+        "curriculum": BASE_DIR / "models" / "run1" / "curriculum.pth",
+    },
+    "Run 2": {
+        "vanilla": BASE_DIR / "models" / "run2" / "vanilla.pth",
+        "curriculum": BASE_DIR / "models" / "run2" / "curriculum.pth",
+    },
+    "Run 3": {
+        "vanilla": BASE_DIR / "models" / "run3" / "vanilla.pth",
+        "curriculum": BASE_DIR / "models" / "run3" / "curriculum.pth",
+    },
+}
+
+fallback_classes = tuple(DEFAULT_CLASS_NAMES)
+device_name = "cuda" if torch.cuda.is_available() else "cpu"
+
 with st.sidebar:
-    st.header("1. Model checkpoints")
-    st.warning("Only upload `.pth` / `.pt` files you created or trust. PyTorch checkpoints can contain pickled data.")
-    vanilla_file = st.file_uploader("Standard / Vanilla weights", type=["pth", "pt"], key="vanilla")
-    curriculum_file = st.file_uploader("Curriculum weights", type=["pth", "pt"], key="curriculum")
-
-    st.header("2. Fallback class order")
-    st.caption("Used only if the checkpoint does not contain `class_names`.")
-    fallback_text = st.text_area(
-        "One class per line, in output-index order",
-        value="\n".join(DEFAULT_CLASS_NAMES),
-        height=120,
+    st.header("Model Selection")
+    selected_run = st.radio(
+        "Select trained model run",
+        list(MODEL_PATHS.keys()),
     )
-    fallback_classes = tuple(line.strip() for line in fallback_text.splitlines() if line.strip())
-
-    device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    st.caption(
+        "The corresponding Vanilla and Curriculum checkpoints are loaded automatically."
+    )
     st.caption(f"Inference device: **{device_name.upper()}**")
 
-if len(fallback_classes) != 4:
-    st.error("This thesis model expects exactly four classes in the fallback class order.")
-    st.stop()
+vanilla_path = MODEL_PATHS[selected_run]["vanilla"]
+curriculum_path = MODEL_PATHS[selected_run]["curriculum"]
 
-if vanilla_file is None or curriculum_file is None:
-    st.info("Upload both the Standard/Vanilla and Curriculum checkpoints in the sidebar to begin.")
+missing_files = [
+    str(path.relative_to(BASE_DIR))
+    for path in (vanilla_path, curriculum_path)
+    if not path.is_file()
+]
+
+if missing_files:
+    st.error(
+        f"Missing checkpoint file(s) for {selected_run}: "
+        + ", ".join(missing_files)
+    )
+    st.info(
+        "Add the weights under models/run1, models/run2, and models/run3 using "
+        "the filenames vanilla.pth and curriculum.pth."
+    )
     st.stop()
 
 try:
-    with st.spinner("Loading both ConvNeXtV2 models..."):
+    with st.spinner(f"Loading {selected_run} ConvNeXtV2 models..."):
         vanilla_bundle = load_checkpoint_model(
-            vanilla_file.getvalue(),
-            vanilla_file.name,
+            vanilla_path.read_bytes(),
+            vanilla_path.name,
             fallback_classes,
             device_name,
         )
         curriculum_bundle = load_checkpoint_model(
-            curriculum_file.getvalue(),
-            curriculum_file.name,
+            curriculum_path.read_bytes(),
+            curriculum_path.name,
             fallback_classes,
             device_name,
         )
 except Exception as exc:
+    st.error(f"Failed to load {selected_run} checkpoints.")
     st.exception(exc)
     st.stop()
 
@@ -524,11 +562,12 @@ if vanilla_bundle.class_names != curriculum_bundle.class_names:
 
 CLASS_NAMES = vanilla_bundle.class_names
 
-st.success("Both checkpoints loaded successfully.")
+st.success(f"{selected_run} checkpoints loaded successfully.")
 meta_col1, meta_col2, meta_col3 = st.columns(3)
 meta_col1.metric("Classes", len(CLASS_NAMES))
 meta_col2.metric("Input size", f"{IMG_SIZE} × {IMG_SIZE}")
 meta_col3.metric("Device", device_name.upper())
+st.caption(f"Active model pair: {selected_run}")
 st.caption("Class order: " + " → ".join(CLASS_NAMES))
 
 single_tab, batch_tab = st.tabs(["Single Image + Grad-CAM", "Batch Evaluation + Thesis Metrics"])
@@ -538,7 +577,7 @@ single_tab, batch_tab = st.tabs(["Single Image + Grad-CAM", "Batch Evaluation + 
 # Single-image mode
 # ============================================================
 with single_tab:
-    st.subheader("Single-image comparison")
+    st.subheader(f"Single-image comparison — {selected_run}")
     single_file = st.file_uploader(
         "Upload one poultry fecal image",
         type=["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff"],
@@ -627,7 +666,7 @@ with single_tab:
 # Batch mode
 # ============================================================
 with batch_tab:
-    st.subheader("Labeled batch evaluation")
+    st.subheader(f"Labeled batch evaluation — {selected_run}")
     st.markdown(
         "Upload a ZIP whose folder path contains **both the severity and the true class**. "
         "Severity/class order in the path does not matter."
