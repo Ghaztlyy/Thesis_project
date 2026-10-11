@@ -103,6 +103,9 @@ The app automatically uses CUDA when PyTorch detects a compatible NVIDIA GPU; ot
 
 If you want CUDA inference, install the PyTorch build appropriate for your CUDA environment before installing the remaining dependencies.
 
+you could use the command used in this presentation:
+``pip install --upgrade --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu126``
+
 ## Upload size
 
 `.streamlit/config.toml` raises Streamlit's upload limit to 1 GB for larger evaluation ZIPs.
