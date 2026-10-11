@@ -1,1062 +1,303 @@
-from __future__ import annotations
-
-import gc
+from pathlib import Path
+from collections import Counter
+import csv
 import hashlib
 import io
-import json
-import math
+import logging
+import os
+import shutil
+import tempfile
 import zipfile
-from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from typing import Iterable
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import streamlit as st
 import timm
 import torch
-import torch.nn.functional as F
-from PIL import Image
-from sklearn.metrics import (
-    accuracy_score,
-    confusion_matrix,
-    precision_recall_fscore_support,
-)
-from torchvision.transforms import Compose, InterpolationMode, Normalize, Resize, ToTensor
+from PIL import Image, ImageOps, UnidentifiedImageError
+from torchvision import transforms
+
+ROOT = Path(__file__).resolve().parent
+CLASSES = ['Coccidiosis', 'Healthy', 'New Castle Disease', 'Salmonella']
+MODEL = 'convnextv2_tiny.fcmae_ft_in22k_in1k'
+WEIGHTS = Path(os.getenv('CURRICULUM_WEIGHTS', str(ROOT / 'weights/best_curriculum.pth')))
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+BATCH_SIZE = 32 if DEVICE.type == 'cuda' else 8
+MAX_IMAGES = 10000
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_TOTAL_BYTES = 5 * 1024 * 1024 * 1024
+
+st.set_page_config(page_title='Poultry · Curriculum Classifier', page_icon='🐔', layout='wide')
+st.markdown('''<style>
+.stApp {background:#0e1117;color:#f1f5f9;color-scheme:dark;}
+[data-testid="stHeader"] {background:#0e1117;}
+.stApp h1,.stApp h2,.stApp h3,.stApp p,.stApp label {color:#f1f5f9;}
+[data-testid="stCaptionContainer"] p {color:#a9b8cb;}
+[data-testid="stFileUploaderDropzone"] {background:#1b2330;color:#f1f5f9;border:1px solid #354256;}
+[data-testid="stFileUploaderDropzone"] button {background:#263247;color:#f1f5f9;border-color:#52657e;}
+.block-container {max-width:1120px;padding-top:2.5rem;}
+h1 {letter-spacing:-.04em;}
+[data-testid="stVerticalBlockBorderWrapper"] {background:#161e2b;border-color:#354256;border-radius:18px;}
+.stButton>button {border-radius:10px;}
+</style>''', unsafe_allow_html=True)
 
 
-# ============================================================
-# Thesis configuration
-# ============================================================
-MODEL_NAME = "convnextv2_tiny.fcmae_ft_in22k_in1k"
-IMG_SIZE = 224
-DEFAULT_CLASS_NAMES = [
-    "Coccidiosis",
-    "Healthy",
-    "New Castle Disease",
-    "Salmonella",
-]
-SEVERITY_ORDER = ["Mild", "Moderate", "Severe"]
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+@st.cache_resource(max_entries=1, show_spinner=False)
+def load_model(path: str, modified_ns: int, size: int, device_name: str):
+    # Only load a trusted checkpoint installed on the server, never user uploads.
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError('Expected a state dictionary or checkpoint dictionary.')
+    state = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
+    state = {k.removeprefix('module.'): v for k, v in state.items()}
+    names = checkpoint.get('class_names')
+    if names is None and isinstance(checkpoint.get('experiment_signature'), dict):
+        names = checkpoint['experiment_signature'].get('class_names')
+    names = list(names or CLASSES)
+    if len(names) != 4 or set(names) != set(CLASSES):
+        raise ValueError('Checkpoint must contain the four expected poultry classes.')
 
-st.set_page_config(
-    page_title="ConvNeXtV2 Thesis Evaluator",
-    page_icon="🐔",
-    layout="wide",
-)
-
-
-# ============================================================
-# Utilities
-# ============================================================
-def normalized_name(text: str) -> str:
-    return "".join(ch.lower() for ch in text if ch.isalnum())
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+    model = timm.create_model(MODEL, pretrained=False, num_classes=4)
+    model.load_state_dict(state, strict=True)
+    model.to(torch.device(device_name)).eval()
+    config = timm.data.resolve_model_data_config(model)
+    transform = transforms.Compose([
+        transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        transforms.Normalize(config['mean'], config['std']),
+    ])
+    return model, names, transform
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def get_model():
+    info = WEIGHTS.stat()
+    return load_model(str(WEIGHTS), info.st_mtime_ns, info.st_size, str(DEVICE))
 
 
-def is_git_lfs_pointer(path: Path) -> bool:
-    try:
-        with path.open("rb") as handle:
-            header = handle.read(200)
-    except OSError:
-        return False
-    return header.startswith(b"version https://git-lfs.github.com/spec/v1")
+def open_image(data: bytes):
+    with Image.open(io.BytesIO(data)) as source:
+        image = ImageOps.exif_transpose(source)
+        image.load()
+        return image.convert('RGB')
 
 
-def interpolation_from_name(name: str) -> InterpolationMode:
-    name = (name or "bicubic").lower()
-    return {
-        "nearest": InterpolationMode.NEAREST,
-        "bilinear": InterpolationMode.BILINEAR,
-        "bicubic": InterpolationMode.BICUBIC,
-        "lanczos": InterpolationMode.LANCZOS,
-    }.get(name, InterpolationMode.BICUBIC)
-
-
-def safe_torch_load(checkpoint_path: Path, device: torch.device):
-    """Load a trusted thesis checkpoint directly from disk without duplicating it in RAM."""
-    if is_git_lfs_pointer(checkpoint_path):
-        raise RuntimeError(
-            f"{checkpoint_path.name} is a Git LFS pointer, not the actual checkpoint. "
-            "Run `git lfs pull` (or make sure your deployment downloads Git LFS objects)."
-        )
-    try:
-        return torch.load(checkpoint_path, map_location=device, weights_only=True)
-    except Exception:
-        # The thesis checkpoints are trusted project files and may contain metadata
-        # that requires the full PyTorch loader.
-        return torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-
-def extract_state_dict(checkpoint):
-    if isinstance(checkpoint, dict):
-        if "model_state_dict" in checkpoint:
-            return checkpoint["model_state_dict"]
-        if "state_dict" in checkpoint:
-            return checkpoint["state_dict"]
-        # Raw state_dict: every value should be tensor-like.
-        if checkpoint and all(torch.is_tensor(v) for v in checkpoint.values()):
-            return checkpoint
-    raise ValueError(
-        "Unsupported checkpoint format. Expected a thesis checkpoint containing "
-        "'model_state_dict', a dict containing 'state_dict', or a raw PyTorch state_dict."
-    )
-
-
-def strip_module_prefix(state_dict: dict) -> dict:
-    if state_dict and all(str(k).startswith("module.") for k in state_dict):
-        return {str(k)[7:]: v for k, v in state_dict.items()}
-    return state_dict
-
-
-def checkpoint_class_names(checkpoint) -> list[str] | None:
-    if isinstance(checkpoint, dict):
-        names = checkpoint.get("class_names")
-        if isinstance(names, (list, tuple)) and names:
-            return [str(x) for x in names]
-        signature = checkpoint.get("experiment_signature")
-        if isinstance(signature, dict):
-            names = signature.get("class_names")
-            if isinstance(names, (list, tuple)) and names:
-                return [str(x) for x in names]
-    return None
-
-
-def resolve_num_classes(state_dict: dict, fallback: int = 4) -> int:
-    likely_keys = [
-        "head.fc.weight",
-        "head.weight",
-        "classifier.weight",
-        "fc.weight",
-    ]
-    for key in likely_keys:
-        value = state_dict.get(key)
-        if torch.is_tensor(value) and value.ndim == 2:
-            return int(value.shape[0])
-    for key, value in state_dict.items():
-        if str(key).endswith(".weight") and torch.is_tensor(value) and value.ndim == 2:
-            if int(value.shape[0]) <= 1000:
-                return int(value.shape[0])
-    return fallback
-
-
-@dataclass
-class LoadedModel:
-    name: str
-    model: torch.nn.Module
-    class_names: list[str]
-    transform: Compose
-    checkpoint_meta: dict
-    device: torch.device
-
-
-@st.cache_resource(show_spinner=False, max_entries=2)
-def load_checkpoint_model(
-    checkpoint_path: str,
-    fallback_classes: tuple[str, ...],
-    device_name: str,
-) -> LoadedModel:
-    path = Path(checkpoint_path)
-    device = torch.device(device_name)
-    checkpoint = safe_torch_load(path, device)
-    state_dict = strip_module_prefix(extract_state_dict(checkpoint))
-
-    names = checkpoint_class_names(checkpoint)
-    inferred_classes = resolve_num_classes(state_dict, fallback=len(fallback_classes))
-    if names is None:
-        names = list(fallback_classes)
-    if len(names) != inferred_classes:
-        raise ValueError(
-            f"Checkpoint appears to have {inferred_classes} output classes, but "
-            f"{len(names)} class names were supplied/found."
-        )
-
-    model = timm.create_model(
-        MODEL_NAME,
-        pretrained=False,
-        num_classes=inferred_classes,
-    )
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing or unexpected:
-        raise ValueError(
-            "Checkpoint does not exactly match the expected ConvNeXtV2-Tiny architecture.\n\n"
-            f"Missing keys: {missing[:10]}{'...' if len(missing) > 10 else ''}\n\n"
-            f"Unexpected keys: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}"
-        )
-
-    model = model.to(device)
-    model.eval()
-
-    data_config = timm.data.resolve_model_data_config(model)
-    mean = tuple(data_config["mean"])
-    std = tuple(data_config["std"])
-    interpolation = data_config.get("interpolation", "bicubic")
-
-    transform = Compose(
-        [
-            Resize(
-                (IMG_SIZE, IMG_SIZE),
-                interpolation=interpolation_from_name(interpolation),
-            ),
-            ToTensor(),
-            Normalize(mean=mean, std=std),
-        ]
-    )
-
-    meta = {
-        "file": path.name,
-        "sha256": sha256_file(path),
-        "model_name": checkpoint.get("model_name", MODEL_NAME)
-        if isinstance(checkpoint, dict)
-        else MODEL_NAME,
-        "class_names": names,
-        "input_size": IMG_SIZE,
-        "mean": mean,
-        "std": std,
-        "interpolation": interpolation,
-    }
-    # Release the deserialized checkpoint/state-dict references after the model
-    # has copied the parameters. This matters on memory-constrained deployments.
-    del state_dict
-    del checkpoint
-    gc.collect()
-
-    return LoadedModel(path.name, model, names, transform, meta, device)
-
-
-def pil_rgb(file_or_bytes) -> Image.Image:
-    if hasattr(file_or_bytes, "read"):
-        file_or_bytes.seek(0)
-        image = Image.open(file_or_bytes)
-    else:
-        image = Image.open(io.BytesIO(file_or_bytes))
-    return image.convert("RGB")
-
-
-def predict_one(bundle: LoadedModel, image: Image.Image) -> dict:
-    x = bundle.transform(image).unsqueeze(0).to(bundle.device)
+def classify(image, model, names, transform):
+    tensor = transform(image).unsqueeze(0).to(DEVICE)
     with torch.inference_mode():
-        logits = bundle.model(x)
-        probs = F.softmax(logits, dim=1)[0]
-    idx = int(probs.argmax().item())
-    return {
-        "index": idx,
-        "label": bundle.class_names[idx],
-        "confidence": float(probs[idx].item()),
-        "probabilities": probs.detach().cpu().numpy(),
-    }
+        index = model(tensor).argmax(dim=1).item()
+    return names[index]
 
 
-def batch_predict(bundle: LoadedModel, images: list[Image.Image], batch_size: int) -> tuple[np.ndarray, np.ndarray]:
-    predictions: list[int] = []
-    confidences: list[float] = []
-    for start in range(0, len(images), batch_size):
-        chunk = images[start : start + batch_size]
-        x = torch.stack([bundle.transform(img) for img in chunk]).to(bundle.device)
-        with torch.inference_mode():
-            logits = bundle.model(x)
-            probs = F.softmax(logits, dim=1)
-        conf, pred = probs.max(dim=1)
-        predictions.extend(pred.detach().cpu().tolist())
-        confidences.extend(conf.detach().cpu().tolist())
-    return np.asarray(predictions), np.asarray(confidences)
+def true_label_from_path(filename):
+    # Ground truth comes from a class-named folder, never from the model output.
+    # Example: test/Healthy/image.jpg -> Healthy
+    parent_parts = Path(filename.replace('\\', '/')).parts[:-1]
+    def normalized(value):
+        return ''.join(char for char in value.casefold() if char.isalnum())
+    class_lookup = {normalized(name): name for name in CLASSES}
+    for folder in reversed(parent_parts):
+        if normalized(folder) in class_lookup:
+            return class_lookup[normalized(folder)]
+    return 'Unknown'
 
 
-def gradcam(bundle: LoadedModel, image: Image.Image, class_index: int | None = None) -> tuple[np.ndarray, int]:
-    """Grad-CAM from the output of the final ConvNeXtV2 stage."""
-    model = bundle.model
-    target_layer = model.stages[-1]
-    captured: dict[str, torch.Tensor] = {}
-
-    def hook(_module, _inputs, output):
-        captured["activation"] = output
-        output.retain_grad()
-
-    handle = target_layer.register_forward_hook(hook)
+def process_zip(uploaded_file, model, names, transform):
+    results = []
+    counts = Counter()
+    progress = st.progress(0)
+    status = st.empty()
+    temporary_path = None
     try:
-        model.zero_grad(set_to_none=True)
-        x = bundle.transform(image).unsqueeze(0).to(bundle.device)
-        logits = model(x)
-        if class_index is None:
-            class_index = int(logits.argmax(dim=1).item())
-        score = logits[0, class_index]
-        score.backward()
+        # Back the ZIP with a temporary disk file instead of calling getvalue().
+        uploaded_file.seek(0)
+        with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temp:
+            temporary_path = temp.name
+            shutil.copyfileobj(uploaded_file, temp)
 
-        activation = captured["activation"]
-        gradient = activation.grad
-        if gradient is None:
-            raise RuntimeError("Gradients were not captured for Grad-CAM.")
+        with zipfile.ZipFile(temporary_path) as archive:
+            members = [
+                member for member in archive.infolist()
+                if not member.is_dir()
+                and not member.filename.startswith('__MACOSX/')
+                and not Path(member.filename).name.startswith('.')
+                and Path(member.filename).suffix.lower() in IMAGE_EXTENSIONS
+            ]
+            if not members:
+                raise ValueError('No supported JPG, PNG, or WebP images were found in the ZIP.')
+            if len(members) > MAX_IMAGES:
+                raise ValueError(f'The ZIP exceeds the {MAX_IMAGES:,}-image limit.')
+            if sum(member.file_size for member in members) > MAX_TOTAL_BYTES:
+                raise ValueError('The uncompressed images exceed the 5 GB limit.')
 
-        act = activation.detach()[0]
-        grad = gradient.detach()[0]
+            total = len(members)
+            for start in range(0, total, BATCH_SIZE):
+                batch_members = members[start:start + BATCH_SIZE]
+                tensors, filenames = [], []
+                for member in batch_members:
+                    try:
+                        if member.file_size > MAX_IMAGE_BYTES:
+                            raise ValueError('Image is larger than 20 MB.')
+                        with archive.open(member) as source:
+                            image = open_image(source.read())
+                        tensors.append(transform(image))
+                        filenames.append(member.filename)
+                    except (OSError, ValueError, UnidentifiedImageError,
+                            Image.DecompressionBombError, RuntimeError):
+                        results.append({'Filename': member.filename, 'True Label': true_label_from_path(member.filename), 'Prediction': 'Failed'})
 
-        # ConvNeXt outputs are normally CxHxW. Handle HxWxC defensively.
-        if act.ndim != 3:
-            raise RuntimeError(f"Unexpected final-stage activation shape: {tuple(act.shape)}")
-        channel_axis = int(np.argmax(act.shape))
-        if channel_axis != 0:
-            act = torch.movedim(act, channel_axis, 0)
-            grad = torch.movedim(grad, channel_axis, 0)
+                if tensors:
+                    inputs = torch.stack(tensors).to(DEVICE)
+                    with torch.inference_mode():
+                        indices = model(inputs).argmax(dim=1).cpu().tolist()
+                    for filename, index in zip(filenames, indices):
+                        prediction = names[index]
+                        counts[prediction] += 1
+                        results.append({'Filename': filename, 'True Label': true_label_from_path(filename), 'Prediction': prediction})
+                    del inputs
 
-        weights = grad.mean(dim=(1, 2), keepdim=True)
-        cam = torch.relu((weights * act).sum(dim=0, keepdim=True).unsqueeze(0))
-        cam = F.interpolate(cam, size=image.size[::-1], mode="bilinear", align_corners=False)
-        cam = cam[0, 0]
-        cam -= cam.min()
-        denom = cam.max().clamp_min(1e-8)
-        cam = (cam / denom).detach().cpu().numpy()
-        return cam, class_index
+                completed = min(start + BATCH_SIZE, total)
+                progress.progress(completed / total)
+                status.caption(f'Classified {completed:,} / {total:,} images on {DEVICE.type.upper()}')
     finally:
-        handle.remove()
-        model.zero_grad(set_to_none=True)
+        progress.empty()
+        status.empty()
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+    return results, counts
 
 
-def overlay_heatmap(image: Image.Image, heatmap: np.ndarray, alpha: float = 0.45) -> Image.Image:
-    base = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-    cmap = plt.get_cmap("jet")
-    heat_rgb = cmap(np.clip(heatmap, 0, 1))[..., :3]
-    overlay = np.clip((1 - alpha) * base + alpha * heat_rgb, 0, 1)
-    return Image.fromarray((overlay * 255).astype(np.uint8))
+@st.dialog('Image prediction', width='large')
+def show_prediction_image(uploaded_file, selected_result):
+    filename = selected_result['Filename']
+    st.write(f"**Filename:** {filename}")
+    st.write(f"**True label:** {selected_result['True Label']}")
+    st.write(f"**Prediction:** {selected_result['Prediction']}")
+    try:
+        uploaded_file.seek(0)
+        with zipfile.ZipFile(uploaded_file, 'r') as archive:
+            member = archive.getinfo(filename)
+            if member.file_size > MAX_IMAGE_BYTES:
+                raise ValueError('Image exceeds the 20 MB preview limit.')
+            with archive.open(member) as source:
+                image = open_image(source.read())
+        st.image(image, caption=filename, width='stretch')
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile,
+            Image.DecompressionBombError, UnidentifiedImageError):
+        st.error('Unable to preview this image from the ZIP.')
 
 
-def probability_table(class_names: list[str], probs: np.ndarray) -> pd.DataFrame:
-    return (
-        pd.DataFrame({"Class": class_names, "Probability": probs})
-        .sort_values("Probability", ascending=False)
-        .reset_index(drop=True)
-    )
+def results_csv(results):
+    stream = io.StringIO()
+    writer = csv.DictWriter(stream, fieldnames=['Filename', 'True Label', 'Prediction'])
+    writer.writeheader()
+    writer.writerows(results)
+    return stream.getvalue().encode('utf-8-sig')
 
 
-def metric_dict(y_true: Iterable[int], y_pred: Iterable[int], labels: list[int]) -> dict:
-    y_true = np.asarray(list(y_true))
-    y_pred = np.asarray(list(y_pred))
-    accuracy = accuracy_score(y_true, y_pred)
-    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
-        y_true,
-        y_pred,
-        labels=labels,
-        average="macro",
-        zero_division=0,
-    )
-    return {
-        "Accuracy": float(accuracy),
-        "Macro Precision": float(macro_precision),
-        "Macro Recall": float(macro_recall),
-        "Macro F1": float(macro_f1),
-    }
+st.caption('POULTRY FECAL CLASSIFICATION')
+st.title('ConvNeXtV2 · Curriculum Classifier')
+st.write('Classify a single poultry fecal image or an entire ZIP using the Curriculum-trained model.')
+if DEVICE.type == 'cuda':
+    st.caption(f'Inference: GPU · {torch.cuda.get_device_name(0)} · batch size {BATCH_SIZE}')
+else:
+    st.caption('Inference: CPU (CUDA not available)')
 
-
-def evaluate_thesis_metrics(
-    frame: pd.DataFrame,
-    pred_col: str,
-    class_names: list[str],
-) -> tuple[dict, pd.DataFrame]:
-    labels = list(range(len(class_names)))
-    true_idx = frame["true_index"].to_numpy()
-    pred_idx = frame[pred_col].to_numpy()
-    overall = metric_dict(true_idx, pred_idx, labels)
-
-    rows = []
-    for severity in SEVERITY_ORDER:
-        part = frame[frame["severity"] == severity]
-        if part.empty:
-            continue
-        metrics = metric_dict(part["true_index"], part[pred_col], labels)
-        rows.append({"Severity": severity, **metrics, "Support": len(part)})
-
-    severity_df = pd.DataFrame(rows)
-    severity_lookup = severity_df.set_index("Severity") if not severity_df.empty else pd.DataFrame()
-
-    if all(sev in severity_lookup.index for sev in SEVERITY_ORDER):
-        errors = [1.0 - float(severity_lookup.loc[sev, "Accuracy"]) for sev in SEVERITY_ORDER]
-        overall["Mean Classification Error"] = float(np.mean(errors))
-    else:
-        overall["Mean Classification Error"] = math.nan
-
-    if all(sev in severity_lookup.index for sev in ["Mild", "Severe"]):
-        overall["Accuracy Robustness Drop"] = float(
-            severity_lookup.loc["Mild", "Accuracy"] - severity_lookup.loc["Severe", "Accuracy"]
-        )
-        overall["Macro F1 Robustness Drop"] = float(
-            severity_lookup.loc["Mild", "Macro F1"] - severity_lookup.loc["Severe", "Macro F1"]
-        )
-    else:
-        overall["Accuracy Robustness Drop"] = math.nan
-        overall["Macro F1 Robustness Drop"] = math.nan
-
-    return overall, severity_df
-
-
-def confusion_figure(y_true, y_pred, class_names: list[str], title: str):
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
-    fig, ax = plt.subplots(figsize=(6.5, 5.5))
-    im = ax.imshow(cm)
-    ax.set_title(title)
-    ax.set_xlabel("Predicted class")
-    ax.set_ylabel("True class")
-    ax.set_xticks(range(len(class_names)), class_names, rotation=35, ha="right")
-    ax.set_yticks(range(len(class_names)), class_names)
-    threshold = cm.max() / 2 if cm.size and cm.max() else 0
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    return fig
-
-
-def _zip_maps(class_names: list[str]) -> tuple[dict, dict]:
-    class_map = {normalized_name(name): (idx, name) for idx, name in enumerate(class_names)}
-    severity_map = {normalized_name(sev): sev for sev in SEVERITY_ORDER}
-    severity_map.update({"severity1": "Mild", "s1": "Mild"})
-    severity_map.update({"severity2": "Moderate", "s2": "Moderate"})
-    severity_map.update({"severity3": "Severe", "sever": "Severe", "s3": "Severe"})
-    return class_map, severity_map
-
-
-def open_zip_source(zip_source):
-    """Open a Streamlit UploadedFile (or Path, if reused elsewhere) as a ZIP."""
-    if isinstance(zip_source, Path):
-        return zipfile.ZipFile(zip_source, "r")
-    if hasattr(zip_source, "seek"):
-        zip_source.seek(0)
-    return zipfile.ZipFile(zip_source, "r")
-
-
-def parse_batch_zip_index(zip_source, class_names: list[str]) -> tuple[list[dict], list[str]]:
-    """Read only ZIP metadata. Images are decoded later one inference batch at a time."""
-    class_map, severity_map = _zip_maps(class_names)
-    records: list[dict] = []
-    skipped: list[str] = []
-
-    with open_zip_source(zip_source) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            path = PurePosixPath(info.filename)
-            if path.suffix.lower() not in IMAGE_EXTENSIONS:
-                continue
-
-            parts = [normalized_name(p) for p in path.parts[:-1]]
-            class_hit = next((class_map[p] for p in parts if p in class_map), None)
-            severity_hit = next((severity_map[p] for p in parts if p in severity_map), None)
-            if class_hit is None or severity_hit is None:
-                skipped.append(info.filename)
-                continue
-
-            class_idx, class_name = class_hit
-            records.append(
-                {
-                    "filename": info.filename,
-                    "severity": severity_hit,
-                    "true_index": class_idx,
-                    "true_label": class_name,
-                }
-            )
-
-    return records, skipped
-
-
-def evaluate_zip_streaming(
-    zip_source,
-    records: list[dict],
-    vanilla_bundle: LoadedModel,
-    curriculum_bundle: LoadedModel,
-    batch_size: int,
-    progress,
-) -> tuple[pd.DataFrame, list[str]]:
-    """Decode and infer on only one small image batch at a time."""
-    rows: list[dict] = []
-    decode_skipped: list[str] = []
-    total = len(records)
-
-    with open_zip_source(zip_source) as zf:
-        for start in range(0, total, batch_size):
-            chunk_records = records[start : start + batch_size]
-            valid_records: list[dict] = []
-            images: list[Image.Image] = []
-
-            for record in chunk_records:
-                try:
-                    # Read/decode only this image. Nothing from previous batches is retained.
-                    image = pil_rgb(zf.read(record["filename"]))
-                    image.load()
-                    images.append(image)
-                    valid_records.append(record)
-                except Exception:
-                    decode_skipped.append(record["filename"])
-
-            if images:
-                v_pred, v_conf = batch_predict(vanilla_bundle, images, batch_size)
-                c_pred, c_conf = batch_predict(curriculum_bundle, images, batch_size)
-
-                for idx, record in enumerate(valid_records):
-                    rows.append(
-                        {
-                            "filename": record["filename"],
-                            "severity": record["severity"],
-                            "true_index": record["true_index"],
-                            "true_label": record["true_label"],
-                            "vanilla_pred_index": int(v_pred[idx]),
-                            "vanilla_prediction": vanilla_bundle.class_names[int(v_pred[idx])],
-                            "vanilla_confidence": float(v_conf[idx]),
-                            "curriculum_pred_index": int(c_pred[idx]),
-                            "curriculum_prediction": curriculum_bundle.class_names[int(c_pred[idx])],
-                            "curriculum_confidence": float(c_conf[idx]),
-                        }
-                    )
-
-            for image in images:
-                image.close()
-            del images
-
-            processed = min(start + len(chunk_records), total)
-            fraction = processed / total if total else 1.0
-            progress.progress(
-                fraction,
-                text=f"Evaluating images... {processed:,}/{total:,}",
-            )
-
-    return pd.DataFrame(rows), decode_skipped
-
-
-def format_metric(value: float) -> str:
-    if pd.isna(value):
-        return "N/A"
-    return f"{value * 100:.2f}%"
-
-
-BATCH_STATE_KEYS = [
-    "batch_result_df",
-    "vanilla_metrics",
-    "curriculum_metrics",
-    "vanilla_by_severity",
-    "curriculum_by_severity",
-]
-
-
-def clear_batch_results() -> None:
-    for key in BATCH_STATE_KEYS:
-        st.session_state.pop(key, None)
-
-
-# ============================================================
-# Header
-# ============================================================
-st.title("ConvNeXtV2 Thesis Model Evaluator")
-st.caption(
-    "Compare your standard/vanilla ConvNeXtV2 checkpoint against your sequential-curriculum checkpoint. "
-    "Single-image mode provides predictions and Grad-CAM heatmaps; batch mode computes the thesis metrics."
-)
-
-with st.expander("What this app calculates", expanded=False):
-    st.markdown(
-        """
-        **Single image**
-        - Predicted disease class and confidence for both models
-        - Per-class probabilities
-        - Grad-CAM heatmap for each model
-
-        **Labeled batch ZIP**
-        - Accuracy
-        - Macro Precision
-        - Macro Recall
-        - Macro F1-score
-        - Mild / Moderate / Severe Accuracy and Macro F1
-        - Accuracy Robustness Drop: `Accuracy_Mild - Accuracy_Severe`
-        - Macro-F1 Robustness Drop: `MacroF1_Mild - MacroF1_Severe`
-        - Mean Classification Error (study definition): mean of `1 - Accuracy_s` over Mild, Moderate, Severe
-        - Confusion-matrix heatmaps
-        """
-    )
-
-
-# ============================================================
-# Model checkpoint setup
-# ============================================================
-# Expected folder structure:
-# models/
-# ├── run1/
-# │   ├── vanilla.pth
-# │   └── curriculum.pth
-# ├── run2/
-# │   ├── vanilla.pth
-# │   └── curriculum.pth
-# └── run3/
-#     ├── vanilla.pth
-#     └── curriculum.pth
-
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATHS = {
-    "Run 1": {
-        "vanilla": BASE_DIR / "models" / "run1" / "vanilla.pth",
-        "curriculum": BASE_DIR / "models" / "run1" / "curriculum.pth",
-    },
-    "Run 2": {
-        "vanilla": BASE_DIR / "models" / "run2" / "vanilla.pth",
-        "curriculum": BASE_DIR / "models" / "run2" / "curriculum.pth",
-    },
-    "Run 3": {
-        "vanilla": BASE_DIR / "models" / "run3" / "vanilla.pth",
-        "curriculum": BASE_DIR / "models" / "run3" / "curriculum.pth",
-    },
-}
-
-fallback_classes = tuple(DEFAULT_CLASS_NAMES)
-device_name = "cuda" if torch.cuda.is_available() else "cpu"
-
-with st.sidebar:
-    st.header("Model Selection")
-    selected_run = st.radio(
-        "Select trained model run",
-        list(MODEL_PATHS.keys()),
-    )
-    st.caption(
-        "The corresponding Vanilla and Curriculum checkpoints are loaded automatically."
-    )
-    st.caption(f"Inference device: **{device_name.upper()}**")
-
-previous_run = st.session_state.get("_active_model_run")
-if previous_run is not None and previous_run != selected_run:
-    clear_batch_results()
-    load_checkpoint_model.clear()
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-st.session_state["_active_model_run"] = selected_run
-
-vanilla_path = MODEL_PATHS[selected_run]["vanilla"]
-curriculum_path = MODEL_PATHS[selected_run]["curriculum"]
-
-missing_files = [
-    str(path.relative_to(BASE_DIR))
-    for path in (vanilla_path, curriculum_path)
-    if not path.is_file()
-]
-
-if missing_files:
-    st.error(
-        f"Missing checkpoint file(s) for {selected_run}: "
-        + ", ".join(missing_files)
-    )
-    st.info(
-        "Add the weights under models/run1, models/run2, and models/run3 using "
-        "the filenames vanilla.pth and curriculum.pth."
-    )
+if not WEIGHTS.is_file():
+    st.error(f'Curriculum checkpoint not found: {WEIGHTS}')
     st.stop()
 
-try:
-    with st.spinner(f"Loading {selected_run} ConvNeXtV2 models..."):
-        vanilla_bundle = load_checkpoint_model(
-            str(vanilla_path),
-            fallback_classes,
-            device_name,
-        )
-        curriculum_bundle = load_checkpoint_model(
-            str(curriculum_path),
-            fallback_classes,
-            device_name,
-        )
-except Exception as exc:
-    st.error(f"Failed to load {selected_run} checkpoints.")
-    st.exception(exc)
-    st.stop()
+single_tab, zip_tab = st.tabs(['Single image', 'ZIP batch classification'])
 
-if vanilla_bundle.class_names != curriculum_bundle.class_names:
-    st.error(
-        "The two checkpoints use different class orders. They cannot be compared safely.\n\n"
-        f"Standard: {vanilla_bundle.class_names}\n\n"
-        f"Curriculum: {curriculum_bundle.class_names}"
-    )
-    st.stop()
-
-CLASS_NAMES = vanilla_bundle.class_names
-
-st.success(f"{selected_run} checkpoints loaded successfully.")
-meta_col1, meta_col2, meta_col3 = st.columns(3)
-meta_col1.metric("Classes", len(CLASS_NAMES))
-meta_col2.metric("Input size", f"{IMG_SIZE} × {IMG_SIZE}")
-meta_col3.metric("Device", device_name.upper())
-st.caption(f"Active model pair: {selected_run}")
-st.caption("Class order: " + " → ".join(CLASS_NAMES))
-
-single_tab, batch_tab = st.tabs(["Single Image + Grad-CAM", "Batch Evaluation + Thesis Metrics"])
-
-
-# ============================================================
-# Single-image mode
-# ============================================================
 with single_tab:
-    st.subheader(f"Single-image comparison — {selected_run}")
-    single_file = st.file_uploader(
-        "Upload one poultry fecal image",
-        type=["jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff"],
-        key="single_image",
-    )
-
-    if single_file is not None:
-        image = pil_rgb(single_file)
-        st.image(image, caption=single_file.name, width=360)
-
-        vanilla_result = predict_one(vanilla_bundle, image)
-        curriculum_result = predict_one(curriculum_bundle, image)
-
-        left, right = st.columns(2)
-        with left:
-            st.markdown("### Standard / Vanilla")
-            st.metric("Prediction", vanilla_result["label"])
-            st.metric("Confidence", f"{vanilla_result['confidence'] * 100:.2f}%")
-            vanilla_probs = probability_table(CLASS_NAMES, vanilla_result["probabilities"])
-            st.dataframe(
-                vanilla_probs.style.format({"Probability": "{:.2%}"}),
-                width="stretch",
-                hide_index=True,
-            )
-            st.bar_chart(vanilla_probs.set_index("Class")["Probability"])
-
-        with right:
-            st.markdown("### Curriculum")
-            st.metric("Prediction", curriculum_result["label"])
-            st.metric("Confidence", f"{curriculum_result['confidence'] * 100:.2f}%")
-            curriculum_probs = probability_table(CLASS_NAMES, curriculum_result["probabilities"])
-            st.dataframe(
-                curriculum_probs.style.format({"Probability": "{:.2%}"}),
-                width="stretch",
-                hide_index=True,
-            )
-            st.bar_chart(curriculum_probs.set_index("Class")["Probability"])
-
-        if vanilla_result["label"] == curriculum_result["label"]:
-            st.success(f"Both models agree: **{vanilla_result['label']}**")
-        else:
-            st.warning(
-                f"The models disagree — Standard: **{vanilla_result['label']}**, "
-                f"Curriculum: **{curriculum_result['label']}**"
-            )
-
-        st.divider()
-        st.subheader("Grad-CAM heatmaps")
-        target_mode = st.radio(
-            "Heatmap target",
-            ["Each model's predicted class", "Choose one class for both models"],
-            horizontal=True,
-        )
-        selected_target = None
-        if target_mode == "Choose one class for both models":
-            selected_name = st.selectbox("Target class", CLASS_NAMES)
-            selected_target = CLASS_NAMES.index(selected_name)
-
-        if st.button("Generate Grad-CAM", type="primary"):
-            with st.spinner("Generating Grad-CAM heatmaps..."):
-                v_cam, v_target = gradcam(vanilla_bundle, image, selected_target)
-                c_cam, c_target = gradcam(curriculum_bundle, image, selected_target)
-                v_overlay = overlay_heatmap(image, v_cam)
-                c_overlay = overlay_heatmap(image, c_cam)
-
-            h1, h2 = st.columns(2)
-            with h1:
-                st.image(
-                    v_overlay,
-                    caption=f"Standard / Vanilla — target: {CLASS_NAMES[v_target]}",
-                    width="stretch",
-                )
-            with h2:
-                st.image(
-                    c_overlay,
-                    caption=f"Curriculum — target: {CLASS_NAMES[c_target]}",
-                    width="stretch",
-                )
-            st.caption(
-                "Grad-CAM highlights spatial regions that most influenced the selected class score. "
-                "It is an interpretability aid, not a quantitative robustness metric."
-            )
-
-
-# ============================================================
-# Batch mode
-# ============================================================
-with batch_tab:
-    st.subheader(f"Labeled batch evaluation — {selected_run}")
-    st.markdown(
-        "Upload a ZIP whose folder path contains **both the severity and the true class**. "
-        "Severity/class order in the path does not matter."
-    )
-    st.code(
-        """batch.zip
-├── Mild
-│   ├── Coccidiosis
-│   ├── Healthy
-│   ├── New Castle Disease
-│   └── Salmonella
-├── Moderate
-│   └── ... same four classes ...
-└── Severe
-    └── ... same four classes ...""",
-        language="text",
-    )
-    st.caption(
-        "Aliases `severity1/s1`, `severity2/s2`, and `severity3/s3` are also recognized. "
-        "The class folder names must match the checkpoint class names."
-    )
-
-    # The repository may contain test.zip for storage/reference, but the app
-    # intentionally does not auto-load it. Every visitor supplies their own ZIP.
-    zip_file = st.file_uploader(
-        "Upload labeled batch ZIP",
-        type=["zip"],
-        key="batch_zip",
-        help="Upload your own ZIP containing severity and class folders.",
-    )
-
-    zip_source = zip_file if zip_file is not None else None
-    source_signature = None
-    if zip_file is not None:
-        source_signature = (
-            "upload",
-            zip_file.name,
-            getattr(zip_file, "size", None),
-        )
-
-    batch_size = st.slider(
-        "Inference batch size",
-        min_value=1,
-        max_value=32,
-        value=8,
-        step=1,
-        help="Lower this if the deployed app has limited memory.",
-    )
-
-    if source_signature != st.session_state.get("_batch_source_signature"):
-        clear_batch_results()
-        st.session_state["_batch_source_signature"] = source_signature
-
-    if zip_source is not None:
+    uploaded_image = st.file_uploader('Upload a chicken fecal image', type=['jpg', 'jpeg', 'png', 'webp'], key='single')
+    if uploaded_image is not None:
         try:
-            records, skipped = parse_batch_zip_index(zip_source, CLASS_NAMES)
-        except zipfile.BadZipFile:
-            st.error(
-                "The selected file is not a valid ZIP archive. "
-                "If it is stored with Git LFS, make sure the actual LFS object was downloaded."
-            )
-            records, skipped = [], []
-
-        if not records:
-            st.error(
-                "No labeled images could be parsed. Check that each image path contains a recognized "
-                "severity folder and one of the four checkpoint class names."
-            )
+            if uploaded_image.size > MAX_IMAGE_BYTES:
+                raise ValueError('Image exceeds 20 MB.')
+            image = open_image(uploaded_image.getvalue())
+        except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
+            st.error('This image could not be opened. Upload a valid image under 20 MB.')
         else:
-            preview = pd.DataFrame(
-                [
-                    {
-                        "Filename": r["filename"],
-                        "Severity": r["severity"],
-                        "True class": r["true_label"],
-                    }
-                    for r in records
-                ]
+            image_col, result_col = st.columns([1, 1.35], gap='large')
+            with image_col:
+                st.image(image, caption=uploaded_image.name, width='stretch')
+            with result_col:
+                with st.container(border=True):
+                    st.subheader('Curriculum model')
+                    if st.button('Classify image', type='primary', width='stretch'):
+                        try:
+                            with st.spinner('Classifying…'):
+                                model, names, transform = get_model()
+                                prediction = classify(image, model, names, transform)
+                            st.caption('PREDICTED CLASSIFICATION')
+                            st.markdown(f'### {prediction}')
+                        except Exception:
+                            logging.exception('Single-image classification failed')
+                            st.error('Classification failed. Check server logs.')
+                    else:
+                        st.write('Ready to classify')
+
+with zip_tab:
+    st.write('Upload a ZIP containing class-named folders (e.g. Healthy/image.jpg). The folder provides the true label; predictions are generated by the model. Images without a recognized class folder show Unknown.')
+    uploaded_zip = st.file_uploader('Upload ZIP file', type=['zip'], key='batch')
+    if uploaded_zip is not None:
+        # Reset results if the selected upload changes, even when the filename is the same.
+        upload_id = (uploaded_zip.name, uploaded_zip.size, hashlib.sha256(uploaded_zip.getvalue()).hexdigest())
+        if st.session_state.get('batch_upload_id') != upload_id:
+            st.session_state['batch_upload_id'] = upload_id
+            st.session_state.pop('batch_results', None)
+            st.session_state.pop('batch_counts', None)
+            st.session_state.pop('prediction_table', None)
+        if st.button('Classify ZIP images', type='primary', width='stretch'):
+            try:
+                with st.spinner('Loading Curriculum model…'):
+                    model, names, transform = get_model()
+                results, counts = process_zip(uploaded_zip, model, names, transform)
+                st.session_state['batch_results'] = results
+                st.session_state['batch_counts'] = counts
+            except (ValueError, zipfile.BadZipFile, OSError) as exc:
+                st.error(f'Unable to process ZIP: {exc}')
+            except Exception:
+                logging.exception('ZIP classification failed')
+                st.error('Batch classification failed. Check server logs.')
+
+        if 'batch_results' in st.session_state:
+            results = st.session_state['batch_results']
+            counts = st.session_state['batch_counts']
+            successful = sum(counts.values())
+            st.divider()
+            st.subheader('Batch results')
+            a, b, c = st.columns(3)
+            a.metric('Total images', len(results))
+            b.metric('Classified', successful)
+            c.metric('Failed', len(results) - successful)
+            st.subheader('Predicted class distribution')
+            for col, name in zip(st.columns(4), CLASSES):
+                col.metric(name, counts.get(name, 0))
+            st.subheader('Individual predictions')
+            st.caption('Select an image row, then click Preview selected image.')
+            selection = st.dataframe(
+                results,
+                width='stretch',
+                hide_index=True,
+                on_select='rerun',
+                selection_mode='single-row',
+                key='prediction_table',
             )
-
-            st.success(f"Found {len(records):,} labeled images.")
-            if skipped:
-                st.warning(
-                    f"Skipped {len(skipped):,} image files whose class/severity could not be determined."
-                )
-                with st.expander("Show skipped files"):
-                    st.write(skipped[:500])
-
-            count_table = (
-                preview.groupby(["Severity", "True class"], observed=False)
-                .size()
-                .rename("Images")
-                .reset_index()
-            )
-            st.markdown("#### Batch composition")
-            st.dataframe(count_table, width="stretch", hide_index=True)
-
-            if st.button("Run batch evaluation", type="primary"):
-                progress = st.progress(0, text="Preparing streaming evaluation...")
-                try:
-                    result_df, decode_skipped = evaluate_zip_streaming(
-                        zip_source,
-                        records,
-                        vanilla_bundle,
-                        curriculum_bundle,
-                        batch_size,
-                        progress,
-                    )
-                except RuntimeError as exc:
-                    if "out of memory" in str(exc).lower():
-                        st.error(
-                            "The inference device ran out of memory. "
-                            "Reduce the inference batch size and try again."
-                        )
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        st.stop()
-                    raise
-
-                progress.progress(1.0, text="Evaluation complete.")
-
-                if decode_skipped:
-                    st.warning(
-                        f"Skipped {len(decode_skipped):,} files that could not be decoded as images."
-                    )
-
-                if result_df.empty:
-                    st.error("No valid images were available for inference.")
-                    st.stop()
-
-                vanilla_metrics, vanilla_by_severity = evaluate_thesis_metrics(
-                    result_df,
-                    "vanilla_pred_index",
-                    CLASS_NAMES,
-                )
-                curriculum_metrics, curriculum_by_severity = evaluate_thesis_metrics(
-                    result_df,
-                    "curriculum_pred_index",
-                    CLASS_NAMES,
-                )
-
-                st.session_state["batch_result_df"] = result_df
-                st.session_state["vanilla_metrics"] = vanilla_metrics
-                st.session_state["curriculum_metrics"] = curriculum_metrics
-                st.session_state["vanilla_by_severity"] = vanilla_by_severity
-                st.session_state["curriculum_by_severity"] = curriculum_by_severity
-
-    if "batch_result_df" in st.session_state:
-        result_df = st.session_state["batch_result_df"]
-        vanilla_metrics = st.session_state["vanilla_metrics"]
-        curriculum_metrics = st.session_state["curriculum_metrics"]
-        vanilla_by_severity = st.session_state["vanilla_by_severity"]
-        curriculum_by_severity = st.session_state["curriculum_by_severity"]
-
-        st.divider()
-        st.subheader("Thesis metric comparison")
-        metric_order = [
-            "Accuracy",
-            "Macro Precision",
-            "Macro Recall",
-            "Macro F1",
-            "Accuracy Robustness Drop",
-            "Macro F1 Robustness Drop",
-            "Mean Classification Error",
-        ]
-        comparison_df = pd.DataFrame(
-            {
-                "Metric": metric_order,
-                "Standard / Vanilla": [vanilla_metrics[m] for m in metric_order],
-                "Curriculum": [curriculum_metrics[m] for m in metric_order],
-            }
-        )
-        formatted = comparison_df.copy()
-        for col in ["Standard / Vanilla", "Curriculum"]:
-            formatted[col] = formatted[col].map(format_metric)
-        st.dataframe(formatted, width="stretch", hide_index=True)
-
-        st.caption(
-            "For this app, Mean Classification Error follows the thesis study definition: "
-            "the mean of (1 − Accuracy) across Mild, Moderate, and Severe. "
-            "Robustness Drop compares Mild against Severe."
-        )
-
-        s1, s2 = st.columns(2)
-        with s1:
-            st.markdown("#### Standard / Vanilla by severity")
-            if not vanilla_by_severity.empty:
-                display_v = vanilla_by_severity.copy()
-                for col in ["Accuracy", "Macro Precision", "Macro Recall", "Macro F1"]:
-                    display_v[col] = display_v[col].map(lambda x: f"{x:.2%}")
-                st.dataframe(display_v, width="stretch", hide_index=True)
-        with s2:
-            st.markdown("#### Curriculum by severity")
-            if not curriculum_by_severity.empty:
-                display_c = curriculum_by_severity.copy()
-                for col in ["Accuracy", "Macro Precision", "Macro Recall", "Macro F1"]:
-                    display_c[col] = display_c[col].map(lambda x: f"{x:.2%}")
-                st.dataframe(display_c, width="stretch", hide_index=True)
-
-        st.divider()
-        st.subheader("Confusion-matrix heatmaps")
-        severity_view = st.selectbox("Confusion matrix subset", ["Overall", *SEVERITY_ORDER])
-        cm_df = result_df if severity_view == "Overall" else result_df[result_df["severity"] == severity_view]
-        if cm_df.empty:
-            st.info(f"No {severity_view} samples are present in this batch.")
-        else:
-            cm1, cm2 = st.columns(2)
-            with cm1:
-                fig = confusion_figure(
-                    cm_df["true_index"],
-                    cm_df["vanilla_pred_index"],
-                    CLASS_NAMES,
-                    f"Standard / Vanilla — {severity_view}",
-                )
-                st.pyplot(fig, width="stretch")
-                plt.close(fig)
-            with cm2:
-                fig = confusion_figure(
-                    cm_df["true_index"],
-                    cm_df["curriculum_pred_index"],
-                    CLASS_NAMES,
-                    f"Curriculum — {severity_view}",
-                )
-                st.pyplot(fig, width="stretch")
-                plt.close(fig)
-
-        st.divider()
-        st.subheader("Per-image results")
-        visible_cols = [
-            "filename",
-            "severity",
-            "true_label",
-            "vanilla_prediction",
-            "vanilla_confidence",
-            "curriculum_prediction",
-            "curriculum_confidence",
-        ]
-        display_results = result_df[visible_cols].copy()
-        st.dataframe(
-            display_results.style.format(
-                {
-                    "vanilla_confidence": "{:.2%}",
-                    "curriculum_confidence": "{:.2%}",
-                }
-            ),
-            width="stretch",
-            hide_index=True,
-        )
-
-        metrics_export = {
-            "class_names": CLASS_NAMES,
-            "standard_vanilla": vanilla_metrics,
-            "curriculum": curriculum_metrics,
-            "standard_vanilla_by_severity": vanilla_by_severity.to_dict(orient="records"),
-            "curriculum_by_severity": curriculum_by_severity.to_dict(orient="records"),
-        }
-        d1, d2 = st.columns(2)
-        with d1:
+            selected_rows = selection.selection.rows
+            if st.button(
+                'Preview selected image',
+                disabled=not bool(selected_rows),
+                key='open_batch_preview',
+            ):
+                show_prediction_image(uploaded_zip, results[selected_rows[0]])
             st.download_button(
-                "Download per-image predictions CSV",
-                data=result_df.to_csv(index=False).encode("utf-8"),
-                file_name="convnextv2_batch_predictions.csv",
-                mime="text/csv",
-            )
-        with d2:
-            st.download_button(
-                "Download thesis metrics JSON",
-                data=json.dumps(metrics_export, indent=2, allow_nan=True).encode("utf-8"),
-                file_name="convnextv2_thesis_metrics.json",
-                mime="application/json",
+                'Download predictions CSV',
+                data=results_csv(results),
+                file_name='curriculum_predictions.csv',
+                mime='text/csv',
+                type='primary',
+                width='stretch',
             )
